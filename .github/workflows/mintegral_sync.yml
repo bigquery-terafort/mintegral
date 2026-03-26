@@ -1,0 +1,44 @@
+name: Mintegral → BigQuery Sync
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days of data to pull (default: 30, max: 60)"
+        required: false
+        default: "30"
+
+jobs:
+  sync:
+    name: Sync Mintegral Data to BigQuery
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Mintegral → BigQuery sync
+        env:
+          MINTEGRAL_SKEY:       ${{ secrets.MINTEGRAL_SKEY }}
+          MINTEGRAL_SECRET:     ${{ secrets.MINTEGRAL_SECRET }}
+          GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET:           mintegral_data
+          LOOKBACK_DAYS:        ${{ github.event.inputs.lookback_days || '30' }}
+        run: python mintegral_to_bigquery.py
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "❌ Mintegral sync FAILED. Check logs above."
