@@ -1,19 +1,22 @@
 """
-Mintegral Publisher → BigQuery  ·  COMPLETE PIPELINE
-=====================================================
-Pulls everything from Mintegral Publisher API (static.mintegral.com)
+Mintegral Publisher → BigQuery  ·  COMPLETE PIPELINE v2
+========================================================
+Fixes vs v1:
+  1. Replaced insert_rows_json (streaming) with load_table_from_json (batch load jobs)
+  2. Delete-before-insert for all 7 tables — no duplicates on re-runs
+  3. fetch_pub_revenue_by_adformat: fixed group_by from "date,unit_id" to "date,ad_format"
 
-Authentication: md5(SECRET + md5(time))
+Auth: md5(SECRET + md5(time))
 API limit: max 7 days per request, max 60 days back
 
 Tables:
-  1. pub_revenue_daily         — daily revenue per app
+  1. pub_revenue_daily         — daily revenue totals
   2. pub_revenue_by_country    — revenue by country
   3. pub_revenue_by_platform   — revenue by platform (Android/iOS)
   4. pub_revenue_by_adformat   — revenue by ad format
   5. pub_revenue_by_app        — revenue by app + placement
   6. pub_revenue_by_unit       — revenue by ad unit (most granular)
-  7. pub_revenue_by_bidding    — revenue by bidding type (traditional vs header bidding)
+  7. pub_revenue_by_bidding    — revenue by bidding type
 """
 
 import os, json, logging, hashlib, requests, time
@@ -24,9 +27,8 @@ from google.oauth2 import service_account
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-MINTEGRAL_SKEY       = os.environ["MINTEGRAL_SKEY"]       # Account → API Tools → Report API → skey
-MINTEGRAL_SECRET     = os.environ["MINTEGRAL_SECRET"]     # Account → API Tools → Report API → Secret
+MINTEGRAL_SKEY       = os.environ["MINTEGRAL_SKEY"]
+MINTEGRAL_SECRET     = os.environ["MINTEGRAL_SECRET"]
 GCP_PROJECT          = os.environ["GCP_PROJECT"]
 BQ_DATASET           = os.environ.get("BQ_DATASET", "mintegral_data")
 GCP_CREDENTIALS_JSON = os.environ["GCP_CREDENTIALS_JSON"]
@@ -34,7 +36,7 @@ LOOKBACK_DAYS        = int(os.environ.get("LOOKBACK_DAYS", "30"))
 
 BASE_URL = "https://api.mintegral.com/reporting/v2/data"
 
-# ─── BQ SCHEMAS ───────────────────────────────────────────────────────────────
+# ─── BQ SCHEMAS ──────────────────────────────────────────────────────────────
 SCHEMAS = {
     "pub_revenue_daily": [
         bigquery.SchemaField("date",            "DATE"),
@@ -139,7 +141,10 @@ SCHEMAS = {
     ],
 }
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
+# All 7 tables are date-based — delete by date range before loading
+REPORTING_TABLES = set(SCHEMAS.keys())
+
+# ─── HELPERS ─────────────────────────────────────────────────────────────────
 def safe_float(v):
     try: return float(v) if v not in (None, "", "N/A") else None
     except: return None
@@ -157,24 +162,23 @@ def make_sign(secret, ts):
     return hashlib.md5((secret + inner).encode()).hexdigest()
 
 def fmt_date(d):
-    """Format date as YYYYMMDD for Mintegral API"""
     return d.strftime("%Y%m%d")
 
 def parse_date(d):
-    """Parse Mintegral date int/str to ISO string"""
     s = str(d)
     if len(s) == 8:
         return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
     return s
 
-def fetch_mintegral(group_by, start_date, end_date, extra_params=None):
-    """
-    Fetch data from Mintegral API with automatic pagination.
-    API limit: 7 days per request — handles chunking automatically.
-    """
+def get_date_range():
+    end   = datetime.utcnow().date() - timedelta(days=1)
+    start = end - timedelta(days=LOOKBACK_DAYS - 1)
+    return start, end
+
+def fetch_mintegral(group_by, start_date, end_date):
+    """Fetch with 7-day chunking and pagination."""
     all_rows = []
-    # Chunk into 7-day windows
-    current = start_date
+    current  = start_date
     while current <= end_date:
         chunk_end = min(current + timedelta(days=6), end_date)
         ts   = int(time.time())
@@ -188,25 +192,23 @@ def fetch_mintegral(group_by, start_date, end_date, extra_params=None):
             "group_by": group_by,
             "limit":    10000,
             "page":     1,
-            "timezone": 0,  # UTC
+            "timezone": 0,
         }
-        if extra_params:
-            params.update(extra_params)
-
-        log.info(f"  GET {BASE_URL} group_by={group_by} {fmt_date(current)}→{fmt_date(chunk_end)}")
-
+        log.info(f"  GET group_by={group_by} {fmt_date(current)}→{fmt_date(chunk_end)}")
         try:
             while True:
                 resp = requests.get(BASE_URL, params=params, timeout=60)
+                if not resp.text.strip():
+                    log.warning(f"  Empty response — skipping chunk")
+                    break
                 data = resp.json()
-
                 if data.get("code", "").lower() != "ok":
                     log.warning(f"  API error: {data}")
                     break
-
                 lists = data.get("data", {}).get("lists", [])
+                if lists:
+                    log.info(f"  Got {len(lists)} rows (page {params['page']})")
                 all_rows.extend(lists)
-
                 total_page = data.get("data", {}).get("total_page", 1)
                 if params["page"] >= total_page:
                     break
@@ -215,55 +217,12 @@ def fetch_mintegral(group_by, start_date, end_date, extra_params=None):
                 ts = int(time.time())
                 params["time"] = ts
                 params["sign"] = make_sign(MINTEGRAL_SECRET, ts)
-
         except Exception as e:
             log.warning(f"  Request failed: {e}")
-
         current = chunk_end + timedelta(days=1)
-
     return all_rows
 
-# ─── BQ HELPERS ───────────────────────────────────────────────────────────────
-def get_bq_client():
-    creds = service_account.Credentials.from_service_account_info(
-        json.loads(GCP_CREDENTIALS_JSON),
-        scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    return bigquery.Client(project=GCP_PROJECT, credentials=creds)
-
-def ensure_dataset(client):
-    try: client.get_dataset(BQ_DATASET)
-    except Exception:
-        log.info(f"Creating dataset {BQ_DATASET}")
-        client.create_dataset(bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}"))
-
-def ensure_table(client, name):
-    ref = client.dataset(BQ_DATASET).table(name)
-    try: client.get_table(ref)
-    except Exception:
-        log.info(f"Creating table {name}")
-        client.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
-
-def load_to_bq(client, name, rows):
-    if not rows: log.info(f"  No rows for {name}"); return
-    table_ref  = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
-    BATCH_SIZE = 200
-    total_errors = []
-    for i in range(0, len(rows), BATCH_SIZE):
-        batch = rows[i:i + BATCH_SIZE]
-        try:
-            errs = client.insert_rows_json(table_ref, batch)
-            if errs: total_errors.extend(errs[:2])
-        except Exception as e:
-            log.error(f"  Batch {i} failed: {e}")
-    if total_errors: log.error(f"BQ errors [{name}]: {total_errors[:2]}")
-    else: log.info(f"  ✅ {len(rows):,} rows → {name}")
-
 # ─── FETCH FUNCTIONS ──────────────────────────────────────────────────────────
-def get_date_range():
-    end   = datetime.utcnow().date() - timedelta(days=1)
-    start = end - timedelta(days=LOOKBACK_DAYS - 1)
-    return start, end
-
 def fetch_pub_revenue_daily():
     log.info("Fetching Publisher Revenue Daily...")
     start, end = get_date_range()
@@ -325,7 +284,8 @@ def fetch_pub_revenue_by_adformat():
     log.info("Fetching Publisher Revenue by Ad Format...")
     start, end = get_date_range()
     rows = []
-    for r in fetch_mintegral("date,unit_id", start, end):
+    # FIX v2: group_by="date,ad_format" — was wrongly "date,unit_id"
+    for r in fetch_mintegral("date,ad_format", start, end):
         rows.append({
             "date":         parse_date(r.get("date", "")),
             "ad_format":    r.get("ad_format"),
@@ -346,22 +306,22 @@ def fetch_pub_revenue_by_app():
     rows = []
     for r in fetch_mintegral("date,app_id,platform,placement_id", start, end):
         rows.append({
-            "date":             parse_date(r.get("date", "")),
-            "app_id":           str(r.get("app_id", "")),
-            "app_name":         r.get("app_name"),
-            "app_package":      r.get("app_package"),
-            "platform":         r.get("platform"),
-            "placement_id":     str(r.get("placement_id", "")),
-            "placement_name":   r.get("placement_name"),
-            "request":          safe_int(r.get("request")),
-            "filled":           safe_int(r.get("filled")),
-            "fill_rate":        safe_float(r.get("fill_rate")),
-            "impression":       safe_int(r.get("impression")),
-            "click":            safe_int(r.get("click")),
-            "est_revenue":      safe_float(r.get("est_revenue")),
-            "ecpm":             safe_float(r.get("ecpm")),
-            "ctr":              safe_float(r.get("ctr")),
-            "_ingested_at":     now_ts(),
+            "date":           parse_date(r.get("date", "")),
+            "app_id":         str(r.get("app_id", "")),
+            "app_name":       r.get("app_name"),
+            "app_package":    r.get("app_package"),
+            "platform":       r.get("platform"),
+            "placement_id":   str(r.get("placement_id", "")),
+            "placement_name": r.get("placement_name"),
+            "request":        safe_int(r.get("request")),
+            "filled":         safe_int(r.get("filled")),
+            "fill_rate":      safe_float(r.get("fill_rate")),
+            "impression":     safe_int(r.get("impression")),
+            "click":          safe_int(r.get("click")),
+            "est_revenue":    safe_float(r.get("est_revenue")),
+            "ecpm":           safe_float(r.get("ecpm")),
+            "ctr":            safe_float(r.get("ctr")),
+            "_ingested_at":   now_ts(),
         })
     return rows
 
@@ -371,26 +331,26 @@ def fetch_pub_revenue_by_unit():
     rows = []
     for r in fetch_mintegral("date,app_id,placement_id,unit_id,country", start, end):
         rows.append({
-            "date":             parse_date(r.get("date", "")),
-            "app_id":           str(r.get("app_id", "")),
-            "app_name":         r.get("app_name"),
-            "app_package":      r.get("app_package"),
-            "placement_id":     str(r.get("placement_id", "")),
-            "placement_name":   r.get("placement_name"),
-            "unit_id":          str(r.get("unit_id", "")),
-            "unit_name":        r.get("unit_name"),
-            "ad_format":        r.get("ad_format"),
-            "platform":         r.get("platform"),
-            "country":          r.get("country"),
-            "request":          safe_int(r.get("request")),
-            "filled":           safe_int(r.get("filled")),
-            "fill_rate":        safe_float(r.get("fill_rate")),
-            "impression":       safe_int(r.get("impression")),
-            "click":            safe_int(r.get("click")),
-            "est_revenue":      safe_float(r.get("est_revenue")),
-            "ecpm":             safe_float(r.get("ecpm")),
-            "ctr":              safe_float(r.get("ctr")),
-            "_ingested_at":     now_ts(),
+            "date":           parse_date(r.get("date", "")),
+            "app_id":         str(r.get("app_id", "")),
+            "app_name":       r.get("app_name"),
+            "app_package":    r.get("app_package"),
+            "placement_id":   str(r.get("placement_id", "")),
+            "placement_name": r.get("placement_name"),
+            "unit_id":        str(r.get("unit_id", "")),
+            "unit_name":      r.get("unit_name"),
+            "ad_format":      r.get("ad_format"),
+            "platform":       r.get("platform"),
+            "country":        r.get("country"),
+            "request":        safe_int(r.get("request")),
+            "filled":         safe_int(r.get("filled")),
+            "fill_rate":      safe_float(r.get("fill_rate")),
+            "impression":     safe_int(r.get("impression")),
+            "click":          safe_int(r.get("click")),
+            "est_revenue":    safe_float(r.get("est_revenue")),
+            "ecpm":           safe_float(r.get("ecpm")),
+            "ctr":            safe_float(r.get("ctr")),
+            "_ingested_at":   now_ts(),
         })
     return rows
 
@@ -400,23 +360,76 @@ def fetch_pub_revenue_by_bidding():
     rows = []
     for r in fetch_mintegral("date,app_id,bidding_type", start, end):
         rows.append({
-            "date":             parse_date(r.get("date", "")),
-            "app_id":           str(r.get("app_id", "")),
-            "app_name":         r.get("app_name"),
-            "bidding_type":     r.get("bidding_type"),
-            "impression":       safe_int(r.get("impression")),
-            "click":            safe_int(r.get("click")),
-            "est_revenue":      safe_float(r.get("est_revenue")),
-            "ecpm":             safe_float(r.get("ecpm")),
-            "hb_load":          safe_int(r.get("hb_load")),
-            "hb_load_filled":   safe_int(r.get("hb_load_filled")),
-            "_ingested_at":     now_ts(),
+            "date":           parse_date(r.get("date", "")),
+            "app_id":         str(r.get("app_id", "")),
+            "app_name":       r.get("app_name"),
+            "bidding_type":   r.get("bidding_type"),
+            "impression":     safe_int(r.get("impression")),
+            "click":          safe_int(r.get("click")),
+            "est_revenue":    safe_float(r.get("est_revenue")),
+            "ecpm":           safe_float(r.get("ecpm")),
+            "hb_load":        safe_int(r.get("hb_load")),
+            "hb_load_filled": safe_int(r.get("hb_load_filled")),
+            "_ingested_at":   now_ts(),
         })
     return rows
 
-# ─── MAIN ──────────────────────────────────────────────────────────────────────
+# ─── BIGQUERY ─────────────────────────────────────────────────────────────────
+def get_bq_client():
+    creds = service_account.Credentials.from_service_account_info(
+        json.loads(GCP_CREDENTIALS_JSON),
+        scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return bigquery.Client(project=GCP_PROJECT, credentials=creds)
+
+def ensure_dataset(client):
+    try: client.get_dataset(BQ_DATASET)
+    except Exception:
+        log.info(f"Creating dataset {BQ_DATASET}")
+        client.create_dataset(bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}"))
+
+def ensure_table(client, name):
+    ref = client.dataset(BQ_DATASET).table(name)
+    try: client.get_table(ref)
+    except Exception:
+        log.info(f"Creating table {name}")
+        client.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
+
+def load_to_bq(client, name, rows):
+    """
+    FIX v2: Batch load jobs — no streaming buffer issues.
+    Delete date range before loading to prevent duplicates.
+    """
+    if not rows:
+        log.info(f"  No rows for {name}")
+        return
+
+    table_ref  = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
+    start, end = get_date_range()
+
+    # Delete existing rows for this date range
+    try:
+        client.query(
+            f"DELETE FROM `{table_ref}` WHERE date BETWEEN '{start}' AND '{end}'"
+        ).result()
+        log.info(f"  Cleared {name} ({start} to {end})")
+    except Exception as e:
+        log.warning(f"  Could not clear {name}: {e}")
+
+    # Load using batch load job (not streaming)
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=SCHEMAS[name],
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        load_job = client.load_table_from_json(rows, table_ref, job_config=job_config)
+        load_job.result()
+        log.info(f"  ✅ {len(rows):,} rows → {name}")
+    except Exception as e:
+        log.error(f"  Load job failed [{name}]: {e}")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Mintegral Publisher → BigQuery COMPLETE sync")
+    log.info("🚀 Mintegral Publisher → BigQuery COMPLETE sync v2")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days")
 
     bq = get_bq_client()
@@ -432,7 +445,7 @@ def main():
     load_to_bq(bq, "pub_revenue_by_unit",     fetch_pub_revenue_by_unit())
     load_to_bq(bq, "pub_revenue_by_bidding",  fetch_pub_revenue_by_bidding())
 
-    log.info("✅ Mintegral sync complete! 7 tables loaded.")
+    log.info("✅ Mintegral Publisher sync v2 complete! 7 tables loaded.")
 
 if __name__ == "__main__":
     main()
