@@ -1,25 +1,35 @@
 """
-Mintegral Publisher → BigQuery  ·  COMPLETE PIPELINE v2
+Mintegral Publisher → BigQuery  ·  COMPLETE PIPELINE v3
 ========================================================
-Fixes vs v1:
-  1. Replaced insert_rows_json (streaming) with load_table_from_json (batch load jobs)
-  2. Delete-before-insert for all 7 tables — no duplicates on re-runs
-  3. fetch_pub_revenue_by_adformat: fixed group_by from "date,unit_id" to "date,ad_format"
+REPO: bigquery-terafort/mintegral
+
+DATA HAAL (BigQuery se verify): ✅ May/June/July mein 0 missing days
+   (by_app, daily, by_unit — teeno). daily vs by_app farq ~$7/3 mahine
+   (0.03%, per-row rounding).
+
+v3 KE FIX — LANDMINE DEFUSE (aaj ka output BILKUL WAISA HI rehta hai):
+  🛡️ 1. `fetch_mintegral` CHAAR jagah chup-chaap adhoori list deta tha:
+            if not resp.text.strip():  log.warning(...); break     # chunk gaya
+            if code != "ok":           log.warning(...); break     # chunk gaya
+            except Exception as e:     log.warning(...)            # chunk gaya
+            (aur pagination ke beech mein bhi wahi break → aadha page)
+        Phir load_to_bq POORI 30-din window DELETE karke sirf bacha hua
+        likhta tha → jo chunk fail hua, us ke 7 din UR GAYE.
+        Ab: koi bhi chunk fail → poori fetch fail (RuntimeError), kuch
+        delete nahi hota.
+  🛡️ 2. DELETE fail ho to load bilkul nahi (warna duplicate rows).
+  🛡️ 3. Load fail ho to raise — DELETE ho chuki hai, chup rehna sab se bura.
+
+v2 se BARQARAR:
+  ✅ batch load jobs (streaming nahi)
+  ✅ delete-before-insert per date range
+  ✅ fetch_pub_revenue_by_adformat ka group_by="date,ad_format"
 
 Auth: md5(SECRET + md5(time))
 API limit: max 7 days per request, max 60 days back
-
-Tables:
-  1. pub_revenue_daily         — daily revenue totals
-  2. pub_revenue_by_country    — revenue by country
-  3. pub_revenue_by_platform   — revenue by platform (Android/iOS)
-  4. pub_revenue_by_adformat   — revenue by ad format
-  5. pub_revenue_by_app        — revenue by app + placement
-  6. pub_revenue_by_unit       — revenue by ad unit (most granular)
-  7. pub_revenue_by_bidding    — revenue by bidding type
 """
 
-import os, json, logging, hashlib, requests, time
+import os, json, logging, hashlib, requests, time, sys
 from datetime import datetime, timedelta
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -141,17 +151,16 @@ SCHEMAS = {
     ],
 }
 
-# All 7 tables are date-based — delete by date range before loading
 REPORTING_TABLES = set(SCHEMAS.keys())
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def safe_float(v):
     try: return float(v) if v not in (None, "", "N/A") else None
-    except: return None
+    except Exception: return None
 
 def safe_int(v):
     try: return int(float(v)) if v not in (None, "", "N/A") else None
-    except: return None
+    except Exception: return None
 
 def now_ts():
     return datetime.utcnow().isoformat()
@@ -175,10 +184,18 @@ def get_date_range():
     start = end - timedelta(days=LOOKBACK_DAYS - 1)
     return start, end
 
+# 🛡️ v3: koi bhi chunk/page fail hua to poori fetch fail
 def fetch_mintegral(group_by, start_date, end_date):
-    """Fetch with 7-day chunking and pagination."""
+    """v3: adhoori list KABHI wapas nahi jayegi.
+
+    Wajah: caller (load_to_bq) POORI 30-din window DELETE karta hai. Adhoore
+    data ke saath chalne dena = jo chunk fail hua us ke din hamesha ke liye
+    gaye. (Bilkul yehi shakl Apple ke saath hui — aadha saal gaya.)
+    """
     all_rows = []
-    current  = start_date
+    failed_chunks = []
+    current = start_date
+
     while current <= end_date:
         chunk_end = min(current + timedelta(days=6), end_date)
         ts   = int(time.time())
@@ -195,15 +212,19 @@ def fetch_mintegral(group_by, start_date, end_date):
             "timezone": 0,
         }
         log.info(f"  GET group_by={group_by} {fmt_date(current)}→{fmt_date(chunk_end)}")
+
+        chunk_ok = True                                   # 🛡️ v3
         try:
             while True:
                 resp = requests.get(BASE_URL, params=params, timeout=60)
                 if not resp.text.strip():
-                    log.warning(f"  Empty response — skipping chunk")
+                    log.error(f"  🚨 empty response {current}→{chunk_end}")
+                    chunk_ok = False                      # 🛡️ v2: chup-chaap break
                     break
                 data = resp.json()
                 if data.get("code", "").lower() != "ok":
-                    log.warning(f"  API error: {data}")
+                    log.error(f"  🚨 API error {current}→{chunk_end}: {data}")
+                    chunk_ok = False                      # 🛡️
                     break
                 lists = data.get("data", {}).get("lists", [])
                 if lists:
@@ -213,13 +234,22 @@ def fetch_mintegral(group_by, start_date, end_date):
                 if params["page"] >= total_page:
                     break
                 params["page"] += 1
-                # Regenerate sign for next page
                 ts = int(time.time())
                 params["time"] = ts
                 params["sign"] = make_sign(MINTEGRAL_SECRET, ts)
         except Exception as e:
-            log.warning(f"  Request failed: {e}")
+            log.error(f"  🚨 request failed {current}→{chunk_end}: {e}")
+            chunk_ok = False                              # 🛡️
+
+        if not chunk_ok:
+            failed_chunks.append(f"{fmt_date(current)}→{fmt_date(chunk_end)}")
         current = chunk_end + timedelta(days=1)
+
+    if failed_chunks:
+        raise RuntimeError(
+            f"[{group_by}] {len(failed_chunks)} chunk(s) failed "
+            f"({', '.join(failed_chunks)}) — refusing to return a partial "
+            f"result. Existing data will be left untouched.")
     return all_rows
 
 # ─── FETCH FUNCTIONS ──────────────────────────────────────────────────────────
@@ -284,7 +314,6 @@ def fetch_pub_revenue_by_adformat():
     log.info("Fetching Publisher Revenue by Ad Format...")
     start, end = get_date_range()
     rows = []
-    # FIX v2: group_by="date,ad_format" — was wrongly "date,unit_id"
     for r in fetch_mintegral("date,ad_format", start, end):
         rows.append({
             "date":         parse_date(r.get("date", "")),
@@ -395,41 +424,39 @@ def ensure_table(client, name):
         client.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
 
 def load_to_bq(client, name, rows):
-    """
-    FIX v2: Batch load jobs — no streaming buffer issues.
-    Delete date range before loading to prevent duplicates.
-    """
+    """v3: DELETE fail ho to load bilkul nahi; load fail ho to chillao."""
     if not rows:
-        log.info(f"  No rows for {name}")
+        log.warning(f"  ⚠️  No rows for {name} — nothing deleted, nothing loaded")
         return
 
     table_ref  = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
     start, end = get_date_range()
 
-    # Delete existing rows for this date range
     try:
         client.query(
             f"DELETE FROM `{table_ref}` WHERE date BETWEEN '{start}' AND '{end}'"
         ).result()
         log.info(f"  Cleared {name} ({start} to {end})")
     except Exception as e:
-        log.warning(f"  Could not clear {name}: {e}")
+        # 🛡️ DELETE fail + APPEND = duplicate rows
+        log.error(f"  🚨 Could not clear {name}: {e}")
+        raise
 
-    # Load using batch load job (not streaming)
     try:
         job_config = bigquery.LoadJobConfig(
             schema=SCHEMAS[name],
             write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
         )
-        load_job = client.load_table_from_json(rows, table_ref, job_config=job_config)
-        load_job.result()
+        client.load_table_from_json(rows, table_ref, job_config=job_config).result()
         log.info(f"  ✅ {len(rows):,} rows → {name}")
     except Exception as e:
-        log.error(f"  Load job failed [{name}]: {e}")
+        # 🛡️ DELETE ho chuki hai aur load fail — data gaya. Chup mat raho.
+        log.error(f"  🚨 Load job failed [{name}] AFTER delete: {e}")
+        raise
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🚀 Mintegral Publisher → BigQuery COMPLETE sync v2")
+    log.info("🚀 Mintegral Publisher → BigQuery COMPLETE sync v3")
     log.info(f"   Lookback: {LOOKBACK_DAYS} days")
 
     bq = get_bq_client()
@@ -437,15 +464,28 @@ def main():
     for t in SCHEMAS:
         ensure_table(bq, t)
 
-    load_to_bq(bq, "pub_revenue_daily",       fetch_pub_revenue_daily())
-    load_to_bq(bq, "pub_revenue_by_country",  fetch_pub_revenue_by_country())
-    load_to_bq(bq, "pub_revenue_by_platform", fetch_pub_revenue_by_platform())
-    load_to_bq(bq, "pub_revenue_by_adformat", fetch_pub_revenue_by_adformat())
-    load_to_bq(bq, "pub_revenue_by_app",      fetch_pub_revenue_by_app())
-    load_to_bq(bq, "pub_revenue_by_unit",     fetch_pub_revenue_by_unit())
-    load_to_bq(bq, "pub_revenue_by_bidding",  fetch_pub_revenue_by_bidding())
+    failed = []
+    tasks = [
+        ("pub_revenue_daily",       fetch_pub_revenue_daily),
+        ("pub_revenue_by_country",  fetch_pub_revenue_by_country),
+        ("pub_revenue_by_platform", fetch_pub_revenue_by_platform),
+        ("pub_revenue_by_adformat", fetch_pub_revenue_by_adformat),
+        ("pub_revenue_by_app",      fetch_pub_revenue_by_app),
+        ("pub_revenue_by_unit",     fetch_pub_revenue_by_unit),
+        ("pub_revenue_by_bidding",  fetch_pub_revenue_by_bidding),
+    ]
+    for name, fn in tasks:
+        try:
+            load_to_bq(bq, name, fn())
+        except Exception as e:
+            # 🛡️ v3: ek table fail ho to baaki chalne do, LEKIN exit code 1
+            log.error(f"  🚨 {name} FAILED: {e}")
+            failed.append(name)
 
-    log.info("✅ Mintegral Publisher sync v2 complete! 7 tables loaded.")
+    if failed:
+        log.error(f"❌ {len(failed)} table(s) NOT refreshed: {failed}")
+        sys.exit(1)
+    log.info("✅ Mintegral Publisher sync v3 complete! 7 tables loaded.")
 
 if __name__ == "__main__":
     main()
